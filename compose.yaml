@@ -1,0 +1,118 @@
+services:
+  postgres:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-backend_challenge}
+      POSTGRES_USER: ${POSTGRES_USER:-challenge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_development_only}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  migrate:
+    image: migrate/migrate:v4.20.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database=postgres://${POSTGRES_USER:-challenge}:${POSTGRES_PASSWORD:-local_development_only}@postgres:5432/${POSTGRES_DB:-backend_challenge}?sslmode=disable
+    command: [up]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.0
+    command: [start-dev, --import-realm]
+    environment:
+      KC_HOSTNAME: http://localhost:${KEYCLOAK_HOST_PORT:-8081}
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin_local_only
+    ports:
+      - "127.0.0.1:${KEYCLOAK_HOST_PORT:-8081}:8080"
+    volumes:
+      - ./deploy/keycloak/wallet-realm.json:/opt/keycloak/data/import/wallet-realm.json:ro
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf 'GET /health/ready HTTP/1.0\r\n\r\n' >&3;
+          read -r status <&3;
+          [[ "$$status" == *" 200 "* ]]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  ministack:
+    image: ministackorg/ministack:1.5.30
+    environment:
+      AUTH: "true"
+    ports:
+      - "127.0.0.1:${SQS_HOST_PORT:-4566}:4566"
+
+  sqs-setup:
+    build: .
+    user: "0:0"
+    entrypoint: [/sqs-setup]
+    restart: "on-failure:5"
+    depends_on:
+      ministack:
+        condition: service_started
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_ENDPOINT_URL: http://ministack:4566
+      SQS_LOCAL_IAM_SETUP: "true"
+    volumes:
+      - sqs_runtime_credentials:/credentials/runtime
+      - sqs_publisher_credentials:/credentials/publisher
+      - sqs_event_credentials:/credentials/events
+
+  api:
+    build: .
+    stop_grace_period: 35s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      sqs-setup:
+        condition: service_completed_successfully
+    environment:
+      WORKERS_ENABLED: ${WORKERS_ENABLED:-true}
+      OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-8}
+      REFERENCE_MAX_ATTEMPTS: ${REFERENCE_MAX_ATTEMPTS:-100}
+      REFERENCE_TTL: ${REFERENCE_TTL:-24h}
+      SQS_ENABLED: "true"
+      AWS_REGION: us-east-1
+      AWS_SHARED_CREDENTIALS_FILE: /run/aws/credentials
+      AWS_EC2_METADATA_DISABLED: "true"
+      SQS_ENDPOINT_URL: http://ministack:4566
+      HTTP_PORT: "8080"
+      DATABASE_URL: postgres://${POSTGRES_USER:-challenge}:${POSTGRES_PASSWORD:-local_development_only}@postgres:5432/${POSTGRES_DB:-backend_challenge}?sslmode=disable
+      OIDC_ISSUER_URL: http://localhost:${KEYCLOAK_HOST_PORT:-8081}/realms/wallet
+      OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
+      OIDC_AUDIENCE: wallet-api
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8080}:8080"
+    volumes:
+      - sqs_runtime_credentials:/run/aws:ro
+
+volumes:
+  postgres_data:
+  sqs_runtime_credentials:
+  sqs_publisher_credentials:
+  sqs_event_credentials:

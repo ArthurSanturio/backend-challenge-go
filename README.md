@@ -464,3 +464,828 @@ go vet ./...
 Documente separadamente como preparar as dependências dos testes e executar integração, múltiplas instâncias e simulações de falha. Se utilizar build tags, informe os comandos correspondentes.
 
 Entregue código formatado com `gofmt` e dependências reproduzíveis.
+
+
+---
+
+# Guia de execução da solução
+
+As seções anteriores preservam o enunciado do desafio. A partir daqui estão as instruções da implementação disponível neste projeto. As decisões técnicas e limitações estão em [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## 1. Pré-requisitos
+
+- Docker com Docker Compose v2, com o daemon em execução.
+- Go `1.27.2` para executar a aplicação fora do container e rodar testes. Para testes com `-race`, utilize uma instalação com suporte ao detector de corridas e compilador C disponível.
+- `curl` e Python 3 para os exemplos HTTP.
+- AWS CLI v2 para os exemplos opcionais de publicação SQS.
+- Portas locais disponíveis: `8080` (API), `8081` (Keycloak), `5432` (PostgreSQL) e `4566` (MiniStack).
+
+Execute os comandos na raiz do projeto. Os exemplos usam um shell compatível com Bash/Zsh e devem ser executados na mesma sessão para preservar as variáveis.
+
+## 2. Configuração e variáveis de ambiente
+
+Na primeira execução:
+
+```sh
+cp .env.example .env
+```
+
+Se `.env` já existir, confira seus valores em vez de sobrescrevê-lo. [.env.example](.env.example) contém somente valores locais de exemplo, sem segredos reais. `.env` e `.local/` são ignorados pelo Git.
+
+O Compose lê `.env` automaticamente para interpolar sua configuração. O executável Go não carrega esse arquivo sozinho. O arquivo [compose.yaml](compose.yaml) também define valores internos dos containers: por exemplo, `postgres`, `keycloak` e `ministack` substituem `localhost` nos endereços de comunicação interna.
+
+| Variável | Exemplo/padrão local | Uso |
+| --- | --- | --- |
+| `HTTP_PORT` | `8080` | Porta publicada da API; no container ela escuta em `8080` |
+| `POSTGRES_HOST_PORT` | `5432` | Porta do PostgreSQL na máquina |
+| `POSTGRES_DB` | `backend_challenge` | Banco de desenvolvimento |
+| `POSTGRES_USER` | `challenge` | Usuário local do banco |
+| `POSTGRES_PASSWORD` | `local_development_only` | Senha local de exemplo |
+| `DATABASE_URL` | Definida em `.env.example` | Conexão usada ao executar Go na máquina; o Compose monta a conexão interna |
+| `POSTGRES_TEST_URL` | Definida em `.env.example` | Conexão dos testes PostgreSQL; exige permissão para criar bancos descartáveis |
+| `KEYCLOAK_HOST_PORT` | `8081` | Porta do Keycloak na máquina |
+| `OIDC_ISSUER_URL` | `http://localhost:8081/realms/wallet` | Emissor esperado dos tokens |
+| `OIDC_JWKS_URL` | `http://localhost:8081/realms/wallet/protocol/openid-connect/certs` | Endpoint de chaves; dentro do Compose usa o host `keycloak` |
+| `OIDC_AUDIENCE` | `wallet-api` | Audiência esperada dos tokens |
+| `SQS_ENABLED` | `true` | Habilita SQS na execução direta; no Compose está habilitado explicitamente |
+| `AWS_REGION` | `us-east-1` | Região do cliente SQS; o Compose define esse valor explicitamente |
+| `SQS_HOST_PORT` | `4566` | Porta do MiniStack na máquina |
+| `SQS_ENDPOINT_URL` | `http://localhost:4566` | Endpoint local na execução direta; dentro do Compose usa `ministack` |
+| `AWS_SHARED_CREDENTIALS_FILE` | `.local/sqs-runtime-credentials` | Credenciais restritas para executar a API na máquina; no container usa `/run/aws/credentials` |
+| `AWS_EC2_METADATA_DISABLED` | `true` | Evita busca de credenciais de instância no ambiente local |
+| `WORKERS_ENABLED` | `true` | Habilita publicação da outbox e retomada de pendências |
+| `OUTBOX_MAX_ATTEMPTS` | `8` | Tentativas normais de entrega antes do encaminhamento à DLQ |
+| `REFERENCE_MAX_ATTEMPTS` | `100` | Limite de tentativas de resolução de referências |
+| `REFERENCE_TTL` | `24h` | Prazo de espera contado desde a criação da operação |
+
+Se alterar portas, ajuste também as URLs usadas na execução direta e nos exemplos abaixo. Alterar usuário/senha no `.env` não recria usuários de um volume PostgreSQL já inicializado. Erros como `role "challenge" does not exist` podem indicar um volume criado com outras credenciais; alinhe a configuração ao banco existente ou use um ambiente separado.
+
+## 3. Inicialização completa com Docker Compose
+
+```sh
+docker compose up --build -d
+docker compose ps -a
+```
+
+O ambiente inicia PostgreSQL `17.11`, aplica as três migrations com `migrate v4.20.1`, importa o realm do Keycloak `26.8.0` e provisiona o MiniStack `1.5.30`. A API inicia após os serviços de preparação concluírem com sucesso.
+
+`migrate` e `sqs-setup` são tarefas de preparação: é esperado que terminem com código `0`. API, PostgreSQL, Keycloak e MiniStack permanecem em execução.
+
+Confira a disponibilidade:
+
+```sh
+curl --fail-with-body http://localhost:8080/health/live
+curl --fail-with-body http://localhost:8080/health/ready
+```
+
+A readiness verifica PostgreSQL, schema, IdP, consumidor SQS e workers habilitados. Aguarde a inicialização do ambiente antes de fazer chamadas de negócio.
+
+Para acompanhar logs, consultar métricas e parar o ambiente:
+
+```sh
+docker compose logs -f api
+curl --fail-with-body http://localhost:8080/metrics
+docker compose down
+```
+
+`docker compose down` preserva os volumes nomeados e os dados do PostgreSQL.
+
+## 4. Migrations: aplicação e reversão
+
+O fluxo completo do Compose já aplica as migrations. Para prepará-las separadamente:
+
+```sh
+docker compose up -d postgres
+docker compose run --rm migrate up
+docker compose run --rm migrate version
+```
+
+Após aplicar todas, a versão esperada é `3`:
+
+| Versão | Responsabilidade |
+| --- | --- |
+| `000001_initial` | Carteiras, transações, ledger, outbox e invariantes financeiras |
+| `000002_inbox` | Deduplicação persistente do consumidor |
+| `000003_workers` | Leases da outbox e agenda de referências pendentes |
+
+Para reverter a migration mais recente, pare a API antes:
+
+```sh
+docker compose stop api
+docker compose run --rm migrate down 1
+```
+
+A reversão remove estruturas e dados pertencentes àquela versão. Repita `down 1` somente se também quiser reverter versões anteriores. Para reaplicar e reiniciar:
+
+```sh
+docker compose run --rm migrate up
+docker compose up -d api
+```
+
+## 5. Filas e permissões da mensageria
+
+O serviço `sqs-setup` cria automaticamente as filas e configura FIFO, redrive e permissões:
+
+| Fila | Papel |
+| --- | --- |
+| `wager-transactions.fifo` | Solicitações de operações |
+| `wager-transactions-dlq.fifo` | Solicitações que esgotaram o tratamento |
+| `wallet-events.fifo` | Eventos publicados pela outbox |
+| `wallet-events-dlq.fifo` | Eventos com falha persistente de entrega |
+
+A visibilidade das filas principais é de `60` segundos. O redrive das solicitações permite cinco recebimentos. O consumidor usa backoff em falhas e apaga a mensagem somente após o commit do tratamento durável. Uma pendência de referência persistida permite concluir a inbox; sua continuidade pertence ao worker.
+
+A outbox usa leases de `60` segundos e backoff persistente. Após o orçamento de entrega ou um erro permanente de publicação, encaminha o mesmo envelope para a DLQ de eventos. Uma falha na DLQ também mantém retry. Republicações preservam `eventId`; consumidores de eventos devem deduplicar por esse identificador.
+
+As solicitações são internas: somente um publicador confiável tem permissão de envio. Provedores externos usam HTTP/Keycloak e não recebem credenciais da fila. O produtor interno deve validar a identidade de origem e o `providerId` antes de publicar.
+
+No Compose, o setup cria usuários IAM locais separados para runtime da API, publicador de solicitações e consumidor de eventos, com credenciais em volumes distintos. A API recebe apenas seu volume em modo de leitura. `test/test` é uma credencial administrativa exclusiva do setup local.
+
+Para repetir o provisionamento, com o broker em execução:
+
+```sh
+docker compose run --rm sqs-setup
+```
+
+O emulador executa com `AUTH=true`, mas mantém acesso administrativo root/sem assinatura. Use-o somente no ambiente local. As políticas das identidades restritas são exercitadas pelos testes; isso não equivale à validação de segurança em AWS.
+
+Em AWS, use roles administradas pelo deployment, omita `SQS_ENDPOINT_URL` e `SQS_LOCAL_IAM_SETUP` e execute `/sqs-setup` com credenciais de provisionamento e quatro ARNs válidos e distintos:
+
+- `SQS_ADMIN_PRINCIPAL_ARN`
+- `SQS_RUNTIME_PRINCIPAL_ARN`
+- `SQS_TRUSTED_PUBLISHER_PRINCIPAL_ARN`
+- `SQS_EVENT_CONSUMER_PRINCIPAL_ARN`
+
+O setup aplica políticas de recurso com os ARNs reais das filas. As roles, políticas de identidade e relações de confiança pertencem ao deployment. Os modelos estão em [deploy/iam](deploy/iam).
+
+## 6. Autenticação local
+
+O Keycloak importa automaticamente [deploy/keycloak/wallet-realm.json](deploy/keycloak/wallet-realm.json). Não é necessário cadastrar usuários ou clientes manualmente.
+
+| Cliente | Segredo local de exemplo | Permissão |
+| --- | --- | --- |
+| `wallet-service` | `wallet-service-local-secret` | Operações internas de carteira |
+| `provider-a` | `provider-a-local-secret` | Transações do `provider-a` |
+| `provider-b` | `provider-b-local-secret` | Transações do `provider-b` |
+
+Esses valores são fixtures de desenvolvimento. O painel administrativo local do Keycloak fica em `http://localhost:8081`, com usuário `admin` e senha `admin_local_only`.
+
+Prepare as URLs dos exemplos e obtenha tokens com `client_credentials`:
+
+```sh
+API_URL=http://localhost:8080
+KEYCLOAK_URL=http://localhost:8081
+
+INTERNAL_TOKEN=$(curl --fail --silent --show-error \
+  "$KEYCLOAK_URL/realms/wallet/protocol/openid-connect/token" \
+  --data-urlencode grant_type=client_credentials \
+  --data-urlencode client_id=wallet-service \
+  --data-urlencode client_secret=wallet-service-local-secret \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+
+PROVIDER_TOKEN=$(curl --fail --silent --show-error \
+  "$KEYCLOAK_URL/realms/wallet/protocol/openid-connect/token" \
+  --data-urlencode grant_type=client_credentials \
+  --data-urlencode client_id=provider-a \
+  --data-urlencode client_secret=provider-a-local-secret \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+```
+
+Os tokens expiram. Se uma chamada passar a retornar `401`, obtenha novamente o token correspondente. Para o provedor B, repita a obtenção com `client_id=provider-b` e seu segredo local.
+
+## 7. Exemplos HTTP
+
+### Abrir uma carteira
+
+```sh
+RUN_ID=$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')
+PLAYER_ID="player-manual-$RUN_ID"
+
+WALLET_RESPONSE=$(curl --fail --silent --show-error \
+  "$API_URL/wallets" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"playerId\":\"$PLAYER_ID\",\"initialBalance\":{\"amount\":\"100.00\",\"currency\":\"BRL\"}}")
+
+printf '%s\n' "$WALLET_RESPONSE"
+WALLET_ID=$(printf '%s' "$WALLET_RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+Esperado: carteira com saldo `100.00 BRL` e versão `1`. Essa abertura também persiste `OPENING`, ledger e eventos no mesmo commit. Abrir novamente a mesma combinação jogador/moeda retorna `409`.
+
+### Enviar uma aposta e repetir a mesma operação
+
+```sh
+BET_ID="bet-$RUN_ID"
+BET_KEY="provider-a:$BET_ID"
+BET_BODY="{\"providerId\":\"provider-a\",\"externalTransactionId\":\"$BET_ID\",\"playerId\":\"$PLAYER_ID\",\"walletId\":\"$WALLET_ID\",\"roundId\":\"round-$RUN_ID\",\"gameId\":\"manual-game\",\"kind\":\"BET\",\"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}"
+
+curl --fail-with-body "$API_URL/wagering/transactions" \
+  -H "Authorization: Bearer $PROVIDER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $BET_KEY" \
+  -H "X-Correlation-Id: manual-$RUN_ID" \
+  -d "$BET_BODY"
+```
+
+Esperado: `200`, `status=PROCESSED`, saldo `75.00 BRL` e `idempotentReplay=false`. Repita o mesmo comando: o resultado mantém a identidade da transação e o saldo original, com `idempotentReplay=true`, sem novo débito. Alterar o conteúdo usando a mesma chave retorna `409`.
+
+### Consultar a operação, carteira e ledger; reconciliar
+
+```sh
+curl --fail-with-body "$API_URL/providers/provider-a/wagering/transactions/$BET_ID" \
+  -H "Authorization: Bearer $PROVIDER_TOKEN"
+
+curl --fail-with-body "$API_URL/wallets/$WALLET_ID" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+
+curl --fail-with-body "$API_URL/wallets/$WALLET_ID/ledger?limit=50" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+
+curl --fail-with-body -X POST "$API_URL/wallets/$WALLET_ID/reconciliation" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+```
+
+A reconciliação deve retornar saldo armazenado e calculado de `75.00 BRL`, diferença `0.00`, `consistent=true` e dois lançamentos. A resposta do ledger pode incluir `nextCursor`; envie esse valor codificado como parâmetro `cursor` para continuar a paginação. Também existe `GET /wagering/transactions/{transactionId}`, usando o identificador interno devolvido pela aposta.
+
+Para `WIN`, `LOSS`, `REFUND` ou `ROLLBACK`, use uma nova identidade externa e nova chave. `LOSS` exige `0.00`. Reversões exigem `referenceExternalTransactionId`, mesma rodada e valor integral da referência. Referências ainda ausentes geram `202/PENDING_REFERENCE` e são retomadas pelos workers.
+
+### Respostas e permissões
+
+| HTTP | Situação |
+| --- | --- |
+| `201` | Carteira criada |
+| `200` | Consulta, operação processada ou replay processado |
+| `202` | Referência pendente |
+| `400` | Entrada inválida, incluindo dinheiro como número JSON |
+| `401` | Token ausente, inválido ou expirado |
+| `403` | Identidade sem permissão ou provedor incompatível |
+| `404` | Recurso não encontrado |
+| `409` | Conflito de unicidade ou idempotência |
+| `422` | Resultado terminal `REJECTED` ou `FAILED`, com `failureCode` |
+| `503` | Falha que impediu confirmar o processamento; repetir com a mesma chave e conteúdo |
+
+Erros de entrada/acesso usam `{"error":{"code":"...","message":"..."}}`. Resultados financeiros terminais usam `transactionId`, `status`, `failureCode` quando aplicável e `idempotentReplay`. `FAILED` é reservado no domínio: não há encerramento automático nesse estado nos adaptadores atuais. Rejeições como `INSUFFICIENT_FUNDS` são persistidas e reproduzidas em replays. A política detalhada está em [ARCHITECTURE.md](ARCHITECTURE.md#política-de-failed).
+
+## 8. Exemplo SQS com deduplicação entre HTTP e mensageria
+
+Este exemplo reutiliza a aposta da seção anterior. Ele deve concluir a inbox sem aplicar outro débito.
+
+Copie as credenciais do publicador confiável:
+
+```sh
+mkdir -p .local
+docker compose cp sqs-setup:/credentials/publisher/credentials .local/sqs-publisher-credentials
+chmod 600 .local/sqs-publisher-credentials
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+export AWS_SHARED_CREDENTIALS_FILE="$PWD/.local/sqs-publisher-credentials"
+export AWS_DEFAULT_REGION=us-east-1
+export SQS_ENDPOINT_URL=http://localhost:4566
+```
+
+Monte o envelope e os identificadores FIFO:
+
+```sh
+MESSAGE_ID="manual-sqs-$RUN_ID"
+python3 - "$BET_BODY" "$BET_KEY" "$MESSAGE_ID" > .local/wager-request.json <<'PYTHON'
+import datetime, json, sys
+body = json.loads(sys.argv[1])
+body["idempotencyKey"] = sys.argv[2]
+json.dump({
+    "messageId": sys.argv[3],
+    "type": "WagerTransactionRequested",
+    "occurredAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "data": body,
+}, sys.stdout)
+PYTHON
+
+QUEUE_URL=$(aws --endpoint-url "$SQS_ENDPOINT_URL" sqs get-queue-url \
+  --queue-name wager-transactions.fifo --query QueueUrl --output text)
+
+MESSAGE_GROUP_ID=$(python3 -c 'import hashlib,json; d=json.load(open(".local/wager-request.json"))["data"]; print(hashlib.sha256(json.dumps([d["providerId"],d["walletId"]],separators=(",",":"),ensure_ascii=False).encode()).hexdigest())')
+MESSAGE_DEDUP_ID=$(python3 -c 'import hashlib,json; m=json.load(open(".local/wager-request.json"))["messageId"]; print(hashlib.sha256(m.encode()).hexdigest())')
+
+aws --endpoint-url "$SQS_ENDPOINT_URL" sqs send-message \
+  --queue-url "$QUEUE_URL" \
+  --message-body file://.local/wager-request.json \
+  --message-group-id "$MESSAGE_GROUP_ID" \
+  --message-deduplication-id "$MESSAGE_DEDUP_ID"
+```
+
+`MessageGroupId` é SHA-256 do JSON compacto UTF-8 `[providerId,walletId]`. `MessageDeduplicationId` é SHA-256 do `messageId` do envelope. Esses valores roteiam/deduplicam no broker; a garantia financeira continua no PostgreSQL. A janela FIFO pode impedir reenvios de chegarem ao consumidor: para exercitar a inbox, reenvie o mesmo envelope com um novo identificador de deduplicação do broker.
+
+A confirmação de envio da AWS CLI comprova apenas o aceite no broker. Acompanhe o processamento nos logs e confira a inbox:
+
+```sh
+docker compose exec -T postgres psql -U challenge -d backend_challenge \
+  -c "SELECT consumer_name, message_id, completed_at, transaction_id FROM inbox_messages WHERE message_id = '$MESSAGE_ID';"
+```
+
+Após o processamento, deve existir uma entrada concluída ligada à mesma aposta HTTP; o saldo permanece `75.00 BRL`. A consulta usa os nomes padrão de usuário/banco: ajuste-os se modificou `.env`.
+
+Os quatro eventos de saída são `WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged` e `WagerTransactionPendingReference`. São envelopes JSON versionados, com correlação, causa opcional e dados tipados; dinheiro é string decimal. `MessageGroupId` de saída é SHA-256 de `wallet:<walletId>` e `MessageDeduplicationId` é SHA-256 de `eventId`. O consumidor externo usa sua própria identidade; suas credenciais locais ficam em `/credentials/events/credentials` no container `sqs-setup`.
+
+## 9. Execução da API diretamente com Go
+
+Primeiro prepare dependências, migrations, IdP e filas:
+
+```sh
+docker compose build sqs-setup
+docker compose up -d postgres keycloak ministack sqs-setup
+docker compose run --rm migrate up
+docker compose stop api
+mkdir -p .local
+```
+
+Espere o `sqs-setup` concluir com código `0` e o Keycloak ficar saudável, consultando `docker compose ps -a`. Copie as credenciais de runtime geradas pelo setup:
+
+```sh
+docker compose cp sqs-setup:/credentials/runtime/credentials .local/sqs-runtime-credentials
+chmod 600 .local/sqs-runtime-credentials
+```
+
+Exporte a configuração local e execute:
+
+```sh
+set -a
+. ./.env
+set +a
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+go run ./cmd/api
+```
+
+Confira se as URLs em `.env` apontam para as portas locais corretas. Use `Ctrl+C` para encerrar. O ciclo de vida Fx interrompe novas entradas e aguarda os trabalhos em andamento dentro dos prazos configurados antes de fechar os recursos.
+
+## 10. Testes e verificações
+
+### Unitários e análise estática
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+Esses comandos não incluem os arquivos com build tag `integration`.
+
+### Suíte completa com infraestrutura real
+
+```sh
+./scripts/test-system.sh
+```
+
+O script exige Docker/Compose e Go com suporte a `-race`. Compila o executável real, prepara containers isolados de PostgreSQL, Keycloak e MiniStack, executa os testes com `-race -count=1 -tags=integration`, roda `go vet` com a mesma tag e remove os recursos temporários ao terminar. Os testes criam bancos descartáveis; não usam o banco de desenvolvimento. A execução pode levar alguns minutos, inclusive pela espera da visibilidade real do SQS.
+
+### Integração HTTP e token expirado
+
+```sh
+./scripts/test-system.sh -run '^TestHTTP' -v
+```
+
+Inclui PostgreSQL/Keycloak reais, abertura, replay, rejeição, isolamento entre provedores, permissões internas e token realmente expirado. `scripts/test-http-integration.sh` é um alias para a suíte completa.
+
+### Permissões do broker
+
+```sh
+./scripts/test-system.sh -run '^TestSQSBrokerAuthorization$' -v
+```
+
+Verifica identidades restritas, envio e consumo autorizados, negações administrativas, mensagens em lote, credenciais desconhecidas e assinaturas inválidas.
+
+### Três instâncias, concorrência e simulações de falha
+
+```sh
+./scripts/test-system.sh -run '^TestDistributedInstancesAndFailures$' -v
+```
+
+O próprio teste inicia três processos independentes da API, cada um com conexões e memória próprias. Exercita 50 apostas HTTP concorrentes com reentregas SQS da mesma operação, duas apostas de `80.00` sobre saldo `100.00`, carteiras independentes, publishers concorrentes, reinícios, referências pendentes, falhas entre commit/envio/confirmação, retries, DLQ, indisponibilidade das dependências, readiness, composição Fx e reconciliação final do ledger.
+
+### Somente PostgreSQL contra uma dependência já iniciada
+
+```sh
+docker compose up -d postgres
+export POSTGRES_TEST_URL='postgres://challenge:local_development_only@localhost:5432/backend_challenge?sslmode=disable'
+go test -race -count=1 -tags=integration ./internal/postgres -timeout=120s
+go vet -tags=integration ./internal/postgres
+```
+
+Use credenciais compatíveis com seu `.env`, com permissão de criação de bancos. Os testes verificam migrations/reversões, constraints, imutabilidade, atomicidade, replay persistente, inbox e leases.
+
+## 11. Observabilidade e limites
+
+`/metrics` expõe resultados por estado/replay, retries, DLQ, conflitos, latências, pendências e atraso da outbox e divergências de reconciliação. Os logs JSON incluem os identificadores disponíveis; `transactionId` permite ligar o recebimento à retomada e à publicação mesmo quando a correlação da retomada difere da original.
+
+PostgreSQL/SQS indisponíveis permitem retry. Falhas de publicação são tratadas na outbox e não alteram uma operação financeira já processada. Não há uma causa irreversível habilitada para encerrar automaticamente em `FAILED`. As decisões sobre dinheiro, hashes, locks, referências, reversões, inbox/outbox, permissões e shutdown estão em [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Tracing, dashboards, partidas dobradas e testes de carga não foram implementados e são opcionais no desafio. Os comandos de teste acima permitem verificar a versão local; este guia não substitui o resultado de uma execução da suíte.
+
+## 12. Roteiro de testes em ordem
+
+Este roteiro reúne os comandos e a finalidade de cada verificação. Execute na raiz do projeto, na mesma sessão de terminal, com as portas padrão. Requer Docker/Compose, Go, `curl` e Python 3. Os testes manuais criam dados no banco local de desenvolvimento; a suíte automatizada usa infraestrutura temporária isolada. Nenhum comando abaixo envia alterações ao GitHub.
+
+Para repetir o roteiro, comece pela etapa 3 para gerar novos identificadores e obter tokens atualizados. Siga a ordem: os saldos esperados dependem das operações anteriores. As funções `get_token`, `make_body` e `send_wager` são auxiliares do terminal, sem alteração no código da aplicação.
+
+### Etapa 1 — Preparar ambiente e migrations
+
+**Finalidade:** verificar build, inicialização das dependências, provisionamento de filas/identidades e versão do schema.
+
+```sh
+[ -f .env ] || cp .env.example .env
+docker compose up --build -d
+docker compose ps -a
+docker compose run --rm migrate version
+```
+
+**Esperado:** API, PostgreSQL, Keycloak e MiniStack em execução; `migrate` e `sqs-setup` concluídos com `Exited (0)`. A versão das migrations deve ser `3`, sem indicação de estado sujo. Confira se os valores de um `.env` já existente correspondem ao ambiente local descrito neste README.
+
+### Etapa 2 — Verificar saúde
+
+**Finalidade:** distinguir processo disponível de dependências prontas para uso.
+
+```sh
+curl -i http://localhost:8080/health/live
+curl -i http://localhost:8080/health/ready
+```
+
+**Esperado:** HTTP `200` em ambos. Na readiness, PostgreSQL, schema, IdP, SQS e workers habilitados devem estar `ready`.
+
+### Etapa 3 — Obter tokens e criar identificadores
+
+**Finalidade:** usar identidades reais do Keycloak e separar os dados de cada execução manual.
+
+```sh
+API_URL=http://localhost:8080
+KEYCLOAK_URL=http://localhost:8081
+
+get_token() {
+  curl --fail --silent --show-error \
+    "$KEYCLOAK_URL/realms/wallet/protocol/openid-connect/token" \
+    --data-urlencode grant_type=client_credentials \
+    --data-urlencode "client_id=$1" \
+    --data-urlencode "client_secret=$1-local-secret" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+}
+
+INTERNAL_TOKEN=$(get_token wallet-service)
+PROVIDER_TOKEN=$(get_token provider-a)
+PROVIDER_B_TOKEN=$(get_token provider-b)
+
+RUN_ID=$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')
+PLAYER_ID="player-test-$RUN_ID"
+```
+
+**Esperado:** nenhum erro. As atribuições normalmente não exibem saída. Não é necessário imprimir os tokens.
+
+Os tokens expiram. Se receber `401` inesperado durante o roteiro, renove a identidade usada e repita a chamada que falhou:
+
+```sh
+INTERNAL_TOKEN=$(get_token wallet-service)
+PROVIDER_TOKEN=$(get_token provider-a)
+PROVIDER_B_TOKEN=$(get_token provider-b)
+```
+
+Renovar tokens não exige recriar a carteira nem alterar os identificadores das operações.
+
+### Etapa 4 — Abrir uma carteira e verificar duplicidade
+
+**Finalidade:** validar abertura positiva e unicidade por jogador/moeda.
+
+```sh
+WALLET_RESPONSE=$(curl --fail --silent --show-error \
+  "$API_URL/wallets" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"playerId\":\"$PLAYER_ID\",\"initialBalance\":{\"amount\":\"100.00\",\"currency\":\"BRL\"}}")
+
+printf '%s\n' "$WALLET_RESPONSE"
+WALLET_ID=$(printf '%s' "$WALLET_RESPONSE" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+**Esperado:** saldo `100.00 BRL`, versão `1` e identidade salva em `WALLET_ID`.
+
+Tente abrir novamente para o mesmo jogador e moeda, sem sobrescrever as variáveis da carteira criada:
+
+```sh
+curl -i "$API_URL/wallets" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"playerId\":\"$PLAYER_ID\",\"initialBalance\":{\"amount\":\"100.00\",\"currency\":\"BRL\"}}"
+```
+
+**Esperado:** `409 Conflict`.
+
+### Etapa 5 — Preparar funções auxiliares de operações
+
+**Finalidade:** montar o mesmo contrato JSON e os headers necessários sem repetir todos os campos a cada chamada.
+
+`make_body` recebe tipo, identidade externa, valor decimal e referência opcional. `send_wager` recebe o sufixo da chave e o corpo; sua saída inclui o código HTTP.
+
+```sh
+make_body() {
+  python3 - "$1" "$2" "$3" "${4:-}" "$PLAYER_ID" "$WALLET_ID" "$RUN_ID" <<'PY'
+import json, sys
+
+kind, external_id, amount, reference, player, wallet, run = sys.argv[1:]
+body = {
+    "providerId": "provider-a",
+    "externalTransactionId": external_id,
+    "playerId": player,
+    "walletId": wallet,
+    "roundId": "round-" + run,
+    "gameId": "manual-game",
+    "kind": kind,
+    "money": {"amount": amount, "currency": "BRL"},
+}
+if reference:
+    body["referenceExternalTransactionId"] = reference
+print(json.dumps(body))
+PY
+}
+
+send_wager() {
+  curl --silent --show-error \
+    -w '\nHTTP %{http_code}\n' \
+    "$API_URL/wagering/transactions" \
+    -H "Authorization: Bearer $PROVIDER_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -H "Idempotency-Key: provider-a:$1" \
+    -H "X-Correlation-Id: manual-$RUN_ID" \
+    -d "$2"
+}
+```
+
+**Esperado:** as funções são definidas sem saída. O envio seguinte comprova seu funcionamento. O helper exibe respostas de erro para análise, sem tratar HTTP `4xx` esperado como falha de execução do shell.
+
+### Etapa 6 — Testar BET, replay e conflitos
+
+**Finalidade:** comprovar débito único, identidade persistente e rejeição de reutilização indevida de chave ou ID externo.
+
+```sh
+BET_ID="bet-$RUN_ID"
+BET_BODY=$(make_body BET "$BET_ID" 25.00)
+send_wager "$BET_ID" "$BET_BODY"
+```
+
+**Esperado:** `200/PROCESSED`, saldo `75.00` e `idempotentReplay=false`.
+
+```sh
+send_wager "$BET_ID" "$BET_BODY"
+```
+
+**Esperado:** mesma transação, saldo original `75.00` e `idempotentReplay=true`.
+
+```sh
+CONFLICT_BODY=$(make_body BET "$BET_ID" 26.00)
+send_wager "$BET_ID" "$CONFLICT_BODY"
+send_wager "another-key-$RUN_ID" "$BET_BODY"
+```
+
+**Esperado:** `409` nas duas chamadas. A primeira reutiliza a chave com conteúdo diferente; a segunda tenta usar outra chave para a mesma operação externa. Nenhuma deve aplicar outro débito.
+
+### Etapa 7 — Testar WIN, LOSS, REFUND e ROLLBACK
+
+**Finalidade:** conferir os demais tipos externos, seus efeitos e a proteção contra reversão duplicada.
+
+Execute na ordem:
+
+```sh
+WIN_ID="win-$RUN_ID"
+send_wager "$WIN_ID" "$(make_body WIN "$WIN_ID" 10.00)"
+
+LOSS_ID="loss-$RUN_ID"
+send_wager "$LOSS_ID" "$(make_body LOSS "$LOSS_ID" 0.00)"
+
+REFUND_ID="refund-$RUN_ID"
+send_wager "$REFUND_ID" "$(make_body REFUND "$REFUND_ID" 25.00 "$BET_ID")"
+
+ROLLBACK_ID="rollback-$RUN_ID"
+send_wager "$ROLLBACK_ID" "$(make_body ROLLBACK "$ROLLBACK_ID" 10.00 "$WIN_ID")"
+```
+
+| Operação | HTTP/estado esperado | Saldo original do resultado |
+| --- | --- | --- |
+| WIN de `10.00` | `200/PROCESSED` | `85.00` |
+| LOSS de `0.00` | `200/PROCESSED` | `85.00` |
+| REFUND integral da BET | `200/PROCESSED` | `110.00` |
+| ROLLBACK integral do WIN | `200/PROCESSED` | `100.00` |
+
+`LOSS` não incrementa a versão e não cria ledger. Tente uma segunda devolução da mesma aposta:
+
+```sh
+DUP_REFUND_ID="duplicate-refund-$RUN_ID"
+send_wager "$DUP_REFUND_ID" \
+  "$(make_body REFUND "$DUP_REFUND_ID" 25.00 "$BET_ID")"
+```
+
+**Esperado:** `422/REJECTED`, com `failureCode=ALREADY_REVERSED`.
+
+### Etapa 8 — Testar saldo insuficiente e replay de rejeição
+
+**Finalidade:** verificar recusa auditável sem alterar o saldo e reprodução do resultado rejeitado.
+
+```sh
+LOW_BET_ID="insufficient-$RUN_ID"
+send_wager "$LOW_BET_ID" "$(make_body BET "$LOW_BET_ID" 101.00)"
+send_wager "$LOW_BET_ID" "$(make_body BET "$LOW_BET_ID" 101.00)"
+```
+
+**Esperado:** ambas retornam `422/REJECTED`, com `INSUFFICIENT_FUNDS` e a mesma identidade interna. A segunda tem `idempotentReplay=true`. O saldo permanece `100.00`.
+
+### Etapa 9 — Rejeitar dinheiro inválido e OPENING externo
+
+**Finalidade:** conferir validação de transporte/formato antes de aceitar uma operação financeira.
+
+Dinheiro como número JSON:
+
+```sh
+INVALID_ID="invalid-money-$RUN_ID"
+INVALID_BODY=$(make_body BET "$INVALID_ID" 1.25 \
+  | python3 -c 'import json,sys; b=json.load(sys.stdin); b["money"]["amount"]=1.25; print(json.dumps(b))')
+send_wager "$INVALID_ID" "$INVALID_BODY"
+```
+
+Negativos, escala excedente, notação científica e abertura externa:
+
+```sh
+send_wager "negative-$RUN_ID" "$(make_body BET "negative-$RUN_ID" -1.00)"
+send_wager "scale-$RUN_ID" "$(make_body BET "scale-$RUN_ID" 1.001)"
+send_wager "scientific-$RUN_ID" "$(make_body BET "scientific-$RUN_ID" 1e2)"
+send_wager "opening-$RUN_ID" "$(make_body OPENING "opening-$RUN_ID" 10.00)"
+```
+
+**Esperado:** HTTP `400` em todas, sem movimentações financeiras.
+
+### Etapa 10 — Testar autenticação e isolamento
+
+**Finalidade:** conferir recusa de credenciais inválidas e restrição das identidades de provedor.
+
+```sh
+curl -i "$API_URL/wallets/$WALLET_ID"
+
+curl -i "$API_URL/wallets/$WALLET_ID" \
+  -H 'Authorization: Bearer invalid-token'
+
+curl -i "$API_URL/wallets/$WALLET_ID" \
+  -H "Authorization: Bearer $PROVIDER_TOKEN"
+
+curl -i "$API_URL/providers/provider-a/wagering/transactions/$BET_ID" \
+  -H "Authorization: Bearer $PROVIDER_B_TOKEN"
+```
+
+**Esperado, na ordem:** `401`, `401`, `403`, `403`. Para interpretar os `403` corretamente, os tokens dos provedores precisam continuar válidos; renove-os se necessário. A expiração real é coberta pela suíte da etapa 15 e pelo filtro da etapa 16.
+
+### Etapa 11 — Conferir saldo, ledger, reconciliação e saldo original
+
+**Finalidade:** verificar que os movimentos persistidos correspondem ao saldo atual e que o replay preserva o resultado original.
+
+```sh
+curl --fail-with-body "$API_URL/wallets/$WALLET_ID" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+
+curl --fail-with-body "$API_URL/wallets/$WALLET_ID/ledger?limit=50" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+
+curl --fail-with-body -X POST "$API_URL/wallets/$WALLET_ID/reconciliation" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+
+send_wager "$BET_ID" "$BET_BODY"
+```
+
+**Esperado:** carteira com saldo `100.00`, versão `5`, cinco lançamentos e reconciliação com `consistent=true`, diferença `0.00` e `checkedEntries=5`. Os lançamentos são abertura, BET, WIN, REFUND e ROLLBACK. O replay da BET continua retornando o saldo original `75.00`, com `idempotentReplay=true`.
+
+### Etapa 12 — Entregar uma reversão antes da referência
+
+**Finalidade:** comprovar espera persistente e retomada automática pelo worker.
+
+```sh
+EARLY_REFUND_ID="early-refund-$RUN_ID"
+LATE_BET_ID="late-bet-$RUN_ID"
+
+send_wager "$EARLY_REFUND_ID" \
+  "$(make_body REFUND "$EARLY_REFUND_ID" 5.00 "$LATE_BET_ID")"
+```
+
+**Esperado:** `202/PENDING_REFERENCE`, sem alteração de saldo.
+
+```sh
+send_wager "$LATE_BET_ID" "$(make_body BET "$LATE_BET_ID" 5.00)"
+```
+
+**Esperado:** `200/PROCESSED`, com saldo original `95.00`.
+
+```sh
+curl --fail-with-body \
+  "$API_URL/providers/provider-a/wagering/transactions/$EARLY_REFUND_ID" \
+  -H "Authorization: Bearer $PROVIDER_TOKEN"
+```
+
+Repita a consulta até o worker concluir. O backoff pode exigir aguardar alguns segundos entre tentativas.
+
+**Esperado:** reembolso `PROCESSED`, saldo original `100.00` e `referenceTransactionId` vinculado à aposta tardia.
+
+```sh
+INTERNAL_TOKEN=$(get_token wallet-service)
+curl --fail-with-body -X POST "$API_URL/wallets/$WALLET_ID/reconciliation" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+```
+
+**Esperado após concluir o reembolso:** saldo armazenado e calculado `100.00`, diferença `0.00`, `consistent=true` e `checkedEntries=7`.
+
+### Etapa 13 — Conferir outbox, métricas e logs
+
+**Finalidade:** acompanhar publicação e retomada usando o estado durável, as métricas e os identificadores dos logs.
+
+Com os nomes padrão de usuário/banco:
+
+```sh
+docker compose exec -T postgres psql -U challenge -d backend_challenge \
+  -c "SELECT event_type, published_at IS NOT NULL AS published, dead_lettered_at IS NOT NULL AS dead_lettered FROM outbox_events WHERE aggregate_id = '$WALLET_ID' ORDER BY occurred_at, event_id;"
+```
+
+**Esperado:** sete eventos `WalletBalanceChanged`, publicados (`t`) e sem DLQ (`f`) após o worker concluir. Essa consulta seleciona os eventos agregados pela carteira; eventos de transação têm o ID da operação como agregado e não aparecem nesse filtro. Ajuste usuário/banco se alterou `.env`.
+
+```sh
+curl --fail-with-body "$API_URL/metrics" \
+  | grep -E '^wallet_(wager_results_total|background_operations_total|outbox_|reference_jobs_pending|reconciliations_total|storage_metrics_up)'
+
+docker compose logs --no-color api \
+  | grep -E "manual-$RUN_ID|$WALLET_ID"
+```
+
+**Esperado:** métricas de resultados, publicação, espera e reconciliação; em repouso, `wallet_outbox_pending=0`, `wallet_reference_jobs_pending=0` e `wallet_storage_metrics_up=1`. Outros dados já existentes no ambiente podem influenciar os totais globais.
+
+Nos logs, observe operações HTTP, eventos publicados e o reembolso retomado. Use `transactionId` para ligar o recebimento original à retomada, cuja correlação é o ID da operação. Os comandos usam `grep`, sem exigir instalação de `rg`.
+
+### Etapa 14 — Testar domínio, casos de uso e análise estática
+
+**Finalidade:** cobrir parsing, escala, overflow, moedas, invariantes, transições, reidratação, reversões, hashes e rollback, além de procurar condições de corrida e problemas estáticos.
+
+```sh
+go test -count=1 -v ./internal/domain ./internal/application
+go test -race -count=1 ./...
+go vet ./...
+```
+
+**Esperado:** aprovação, sem `FAIL` ou `WARNING: DATA RACE`; `go vet` normalmente termina sem saída quando não encontra problemas. Os comandos desta etapa não incluem os testes com tag `integration`.
+
+### Etapa 15 — Executar toda a integração e validação distribuída
+
+**Finalidade:** comprovar as garantias entre processos e nas fronteiras de falha usando PostgreSQL, Keycloak e MiniStack reais.
+
+```sh
+./scripts/test-system.sh -v
+```
+
+O script compila a API com `-race`, prepara infraestrutura isolada, executa a suíte completa com tag `integration`, roda `go vet` com essa tag e remove os recursos temporários. Pode levar alguns minutos; há esperas pela visibilidade real do SQS.
+
+| Verificação | Resultado esperado |
+| --- | --- |
+| Mesma aposta 50 vezes e reentregas SQS | Um único débito; inbox/idempotência impedem duplicidade |
+| Duas apostas de `80.00` sobre saldo `100.00` | Uma processada, outra rejeitada; saldo `20.00` |
+| Carteiras distintas e três processos | Coordenação por carteira e avanço concorrente |
+| Reinício de processos | Idempotência e referências pendentes preservadas |
+| Queda após commit e antes de apagar a mensagem | Reentrega segura, sem repetir a movimentação |
+| Publishers concorrentes e queda antes/depois do envio | Recuperação de reservas com identidade/payload do evento preservados |
+| Limite e TTL de referência | Resolução ou rejeição durável com código apropriado |
+| Mensagens inválidas e falhas de publicação | Retry e DLQ reais |
+| Permissões do broker | Somente as identidades designadas enviam, consomem e administram |
+| Keycloak real | Credenciais inválidas/expiradas rejeitadas e provedores isolados |
+| Banco real | Constraints, ledger imutável, atomicidade, inbox, leases e migrations reversíveis |
+| Dependências indisponíveis | Readiness sinaliza falha e operação recupera após retorno |
+| Fx e falha parcial de startup | Inicialização/encerramento e liberação de recursos |
+| Reconciliação final | Saldos iguais ao ledger e ausência de lançamentos duplicados |
+
+**Esperado:** todos os testes aprovados, sem testes ignorados ou alertas de corrida, e limpeza dos containers temporários. Linhas `[no test files]` indicam pacotes sem arquivos próprios de teste naquela seleção; vários adaptadores são exercitados pelas suítes de integração e sistema.
+
+### Etapa 16 — Repetir grupos para estudo ou diagnóstico
+
+Os filtros abaixo são opcionais após a aprovação da suíte completa. Cada execução prepara novamente as dependências temporárias.
+
+| Finalidade | Comando |
+| --- | --- |
+| API autenticada e permissões | `./scripts/test-system.sh -run '^TestHTTP' -v` |
+| Token realmente expirado | `./scripts/test-system.sh -run '^TestHTTPRejectsExpiredKeycloakToken$' -v` |
+| Autorizações da mensageria | `./scripts/test-system.sh -run '^TestSQSBrokerAuthorization$' -v` |
+| PostgreSQL, migrations e constraints | `./scripts/test-system.sh -run '^TestPostgres' -v` |
+| Três instâncias e falhas | `./scripts/test-system.sh -run '^TestDistributedInstancesAndFailures$' -v` |
+
+Para estudar publicação manual de uma solicitação SQS, use o exemplo da seção **8. Exemplo SQS com deduplicação entre HTTP e mensageria** deste guia. A etapa 15 já inclui essa integração e comprova recebimentos repetidos na aplicação.
+
+### Checklist de conclusão do roteiro
+
+- [ ] Ambiente, IdP, filas e migrations preparados.
+- [ ] Liveness/readiness retornando `200`.
+- [ ] Carteira aberta e abertura duplicada rejeitada.
+- [ ] BET, WIN, LOSS, REFUND e ROLLBACK com os resultados esperados.
+- [ ] Replays e conflitos sem novos movimentos.
+- [ ] Rejeição por saldo insuficiente persistida e reproduzida.
+- [ ] Entradas monetárias inválidas e OPENING externo rejeitados.
+- [ ] Autenticação e isolamento entre provedores conferidos.
+- [ ] Referência pendente retomada e reconciliada.
+- [ ] Saldo, ledger e versão compatíveis.
+- [ ] Outbox publicada, métricas e logs conferidos.
+- [ ] Testes unitários, detector de corridas e análise estática aprovados.
+- [ ] Integração completa com infraestrutura real e três processos aprovada.
+
+`FAILED` tem suas invariantes e transições testadas no domínio; não existe causa habilitada para produzi-lo automaticamente no runtime. Tracing, dashboards, partidas dobradas e testes de carga são diferenciais opcionais, fora deste roteiro obrigatório.

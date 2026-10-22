@@ -1,0 +1,10 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["sqs:GetQueueUrl", "sqs:SendMessage"],
+      "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo"
+    }
+  ]
+}

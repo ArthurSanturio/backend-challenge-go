@@ -1,0 +1,16 @@
+{
+  "messageId": "manual-sqs-75a977b2a78c",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-10-21T21:35:52Z",
+  "data": {
+    "providerId": "provider-a",
+    "externalTransactionId": "sqs-win-75a977b2a78c",
+    "idempotencyKey": "provider-a:sqs-win-75a977b2a78c",
+    "playerId": "player-manual-75a977b2a78c",
+    "walletId": "f1eb3f0f-0d7a-4583-a23e-3eef9f5e254b",
+    "roundId": "sqs-round-75a977b2a78c",
+    "gameId": "manual-game",
+    "kind": "WIN",
+    "money": {"amount": "5.00", "currency": "BRL"}
+  }
+}

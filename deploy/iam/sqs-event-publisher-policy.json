@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["sqs:GetQueueUrl", "sqs:GetQueueAttributes", "sqs:SendMessage"],
+      "Resource": [
+        "arn:aws:sqs:REGION:ACCOUNT_ID:wallet-events.fifo",
+        "arn:aws:sqs:REGION:ACCOUNT_ID:wallet-events-dlq.fifo"
+      ]
+    }
+  ]
+}

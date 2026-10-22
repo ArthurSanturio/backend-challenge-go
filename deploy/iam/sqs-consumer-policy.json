@@ -1,0 +1,18 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["sqs:GetQueueUrl", "sqs:GetQueueAttributes"],
+      "Resource": [
+        "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo",
+        "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions-dlq.fifo"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility"],
+      "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:wager-transactions.fifo"
+    }
+  ]
+}
